@@ -15,11 +15,14 @@
 #import "NSArray+ArrayUtils.h"
 #import "SFMUCIOption.h"
 #import "SFMUserDefaults.h"
+#include <stdatomic.h>
+#include <sys/sysctl.h>
 
 typedef NS_ENUM(NSInteger, SFMCPURating) {
-    SFMCPURating64Bit,
-    SFMCPURatingSSE42,
-    SFMCPURatingBMI2
+    SFMCPURatingX86_64_SSE41_POPCNT,
+    SFMCPURatingX86_64_BMI2,
+    SFMCPURatingX86_64_AVX512_VNNI,
+    SFMCPURatingArm64
 };
 
 @interface SFMUCIEngine()
@@ -31,6 +34,7 @@ typedef NS_ENUM(NSInteger, SFMCPURating) {
 @property (nonatomic) NSURL *bookmarkUrl;
 
 @property (readwrite, nonatomic) NSDictionary /* <NSNumber, SFMUCILine> */ *lines;
+@property (readwrite, nonatomic) NSString *nnueInfo;
 @property (nonatomic) NSMutableArray /* of SFMUCIOption */ *options;
 
 @property dispatch_group_t analysisGroup;
@@ -39,7 +43,7 @@ typedef NS_ENUM(NSInteger, SFMCPURating) {
 
 @implementation SFMUCIEngine
 
-static volatile int32_t instancesAnalyzing = 0;
+static _Atomic(int) instancesAnalyzing = 0;
 
 #pragma mark - Setters
 
@@ -51,9 +55,10 @@ static volatile int32_t instancesAnalyzing = 0;
         if (isAnalyzing) {
             NSAssert(self.gameToAnalyze != nil, @"Trying to analyze but no game set");
             [self setUciOption:@"MultiPV" integerValue:self.multipv];
+            [self setUciOption:@"Use NNUE" stringValue:self.useNnue ? @"true" : @"false"];
             [self sendCommandToEngine:[self.gameToAnalyze uciString]];
             dispatch_group_enter(_analysisGroup);
-            OSAtomicIncrement32(&instancesAnalyzing);
+            atomic_fetch_add(&instancesAnalyzing, 1);
             [self.bookmarkUrl startAccessingSecurityScopedResource];
             [self sendCommandToEngine:@"go infinite"];
         } else {
@@ -67,7 +72,7 @@ static volatile int32_t instancesAnalyzing = 0;
     if (self.isAnalyzing) {
         self.isAnalyzing = NO;
         dispatch_group_notify(_analysisGroup, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            _gameToAnalyze = gameToAnalyze;
+            self->_gameToAnalyze = gameToAnalyze;
             self.isAnalyzing = YES;
         });
 
@@ -83,11 +88,23 @@ static volatile int32_t instancesAnalyzing = 0;
     if (self.isAnalyzing) {
         self.isAnalyzing = NO;
         dispatch_group_notify(_analysisGroup, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            _multipv = multipv;
+            self->_multipv = multipv;
             self.isAnalyzing = YES;
         });
     } else {
         _multipv = multipv;
+    }
+}
+
+- (void)setUseNnue:(BOOL)useNnue {
+    if (self.isAnalyzing) {
+        self.isAnalyzing = NO;
+        dispatch_group_notify(_analysisGroup, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            self->_useNnue = useNnue;
+            self.isAnalyzing = YES;
+        });
+    } else {
+        _useNnue = useNnue;
     }
 }
 
@@ -170,7 +187,7 @@ static volatile int32_t instancesAnalyzing = 0;
     } else if ([tokens containsObject:@"bestmove"]) {
         // Stopped analysis
         dispatch_group_leave(_analysisGroup);
-        OSAtomicDecrement32(&instancesAnalyzing);
+        atomic_fetch_sub(&instancesAnalyzing, 1);
     } else if ([tokens containsObject:@"id"] && [tokens containsObject:@"name"]) {
         // Engine ID
         [self.delegate uciEngine:self didGetEngineName:[str substringFromIndex:[str rangeOfString:@"id name"].length + 1]];
@@ -190,6 +207,18 @@ static volatile int32_t instancesAnalyzing = 0;
         if ([self.delegate respondsToSelector:@selector(uciEngine:didGetOptions:)]) {
             [self.delegate uciEngine:self didGetOptions:self.options];
         }
+    } else if ([tokens containsObject:@"string"] && [tokens containsObject:@"evaluation"]) {
+        if ([tokens containsObject:@"NNUE"]) {
+            for (NSString *token in tokens) {
+                if ([token containsString:@".nnue"]) {
+                    self.nnueInfo = token;
+                }
+            }
+            [self.delegate uciEngine:self didGetInfoString:_nnueInfo];
+        } else {
+            self.nnueInfo = @"";
+            [self.delegate uciEngine:self didGetInfoString:_nnueInfo];
+        }
     } else {
         // Ignore
     }
@@ -208,17 +237,21 @@ static volatile int32_t instancesAnalyzing = 0;
 
 + (NSString *)bestEnginePath {
     SFMCPURating cpuRating = [SFMUCIEngine cpuRating];
-    if (cpuRating == SFMCPURatingBMI2) {
-        return [[NSBundle mainBundle] pathForResource:@"stockfish-bmi2" ofType:@""];
-    } else if (cpuRating == SFMCPURatingSSE42) {
-        return [[NSBundle mainBundle] pathForResource:@"stockfish-sse42" ofType:@""];
-    } else {
-        return [[NSBundle mainBundle] pathForResource:@"stockfish-64" ofType:@""];
-    }
+    if (cpuRating == SFMCPURatingArm64)
+        return [[NSBundle mainBundle] pathForResource:@"stockfish-arm64" ofType:@""];
+
+    // VNNI 256 is faster than VNNI 512: https://github.com/official-stockfish/Stockfish/pull/3038#issuecomment-679002949
+    if (cpuRating == SFMCPURatingX86_64_AVX512_VNNI)
+        return [[NSBundle mainBundle] pathForResource:@"stockfish-x86-64-vnni256" ofType:@""];
+    if (cpuRating == SFMCPURatingX86_64_BMI2)
+        return [[NSBundle mainBundle] pathForResource:@"stockfish-x86-64-bmi2" ofType:@""];
+
+    return [[NSBundle mainBundle] pathForResource:@"stockfish-x86-64-sse41-popcnt" ofType:@""];
 }
 
 - (instancetype)initWithPathToEngine:(NSString *)path applyPreferences:(BOOL)shouldApplyPreferences;
 {
+    NSLog(@"Launching engine with path %@", path);
     if (self = [super init]) {
         _engineTask = [[NSTask alloc] init];
         NSPipe *inPipe = [[NSPipe alloc] init];
@@ -227,6 +260,8 @@ static volatile int32_t instancesAnalyzing = 0;
         _engineTask.launchPath = path;
         _engineTask.standardInput = inPipe;
         _engineTask.standardOutput = outPipe;
+        // Set current directory so that the engine can locate the .nnue file.
+        _engineTask.currentDirectoryURL = [[NSBundle mainBundle] resourceURL];
         
         _readHandle = [outPipe fileHandleForReading];
         _writeHandle = [inPipe fileHandleForWriting];
@@ -260,21 +295,33 @@ static volatile int32_t instancesAnalyzing = 0;
  */
 + (SFMCPURating)cpuRating
 {
-    NSPipe *outputPipe = [[NSPipe alloc] init];
-    NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/sbin/sysctl"];
-    [task setStandardOutput:outputPipe];
-    [task setArguments:@[@"-n", @"machdep.cpu"]];
-    [task launch];
-    [task waitUntilExit];
-    NSData *data = [[outputPipe fileHandleForReading] availableData];
-    NSString *cpuCapabilities = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if ([cpuCapabilities sfm_containsString:@"BMI2"]) {
-        return SFMCPURatingBMI2;
-    } else if ([cpuCapabilities sfm_containsString:@"POPCNT"]) {
-        return SFMCPURatingSSE42;
+    int ret = 0;
+    size_t size = sizeof(ret);
+    
+    sysctlbyname("hw.optional.arm64", &ret, &size, NULL, 0);
+    if (ret) return SFMCPURatingArm64;
+    
+    // IFMA implies VNNI.
+    sysctlbyname("hw.optional.avx512ifma", &ret, &size, NULL, 0);
+    if (ret) return SFMCPURatingX86_64_AVX512_VNNI;
+    
+    // 2019 Mac Pro uses Cascade Lake Xeon W which doesn't support IFMA but does support VNNI.
+    size_t len = 0;
+    sysctlbyname("hw.model", NULL, &len, NULL, 0);
+    BOOL isMacProWithVnni = NO;
+    if (len) {
+        char *model = malloc(len*sizeof(char));
+        sysctlbyname("hw.model", model, &len, NULL, 0);
+        if (strcmp(model, "MacPro7,1") == 0) isMacProWithVnni = YES;
+        free(model);
     }
-    return SFMCPURating64Bit;
+    if (isMacProWithVnni) return SFMCPURatingX86_64_AVX512_VNNI;
+    
+    sysctlbyname("hw.optional.bmi2", &ret, &size, NULL, 0);
+    if (ret) return SFMCPURatingX86_64_BMI2;
+    
+    // All Macs running Mojave (10.14) or later support SSE4.1 and POPCNT.
+    return SFMCPURatingX86_64_SSE41_POPCNT;
 }
 
 #pragma mark - Instances
@@ -336,7 +383,7 @@ static volatile int32_t instancesAnalyzing = 0;
     if (self.isAnalyzing) {
         // Apparently if you don't balance out your dispatch calls, you'll get very weird crashes
         dispatch_group_leave(_analysisGroup);
-        OSAtomicDecrement32(&instancesAnalyzing);
+        atomic_fetch_sub(&instancesAnalyzing, 1);
     }
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self.engineTask interrupt];
